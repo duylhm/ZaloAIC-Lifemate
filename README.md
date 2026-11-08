@@ -1,19 +1,17 @@
 # Zalo AI Challenge 2026 — LifeMate Offline Agent Pipeline
 
-_Hệ thống tác nhân AI ngoại tuyến hỗ trợ cuộc sống thông minh (LifeMate) đạt chuẩn thể lệ Docker Zalo AI Challenge 2026._
-
-[![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.2%2B-EE4C2C?logo=pytorch)](https://pytorch.org/)
-[![Model](https://img.shields.io/badge/SLM-Qwen2.5--3B--Instruct-blueviolet)](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
-[![ASR](https://img.shields.io/badge/ASR-PhoWhisper--large-green)](https://huggingface.co/vinai/phowhisper-large)
-[![Docker](https://img.shields.io/badge/Docker-Offline%20Compliant-2496ED?logo=docker)](https://www.docker.com/)
-[![Zalo AI Challenge](https://img.shields.io/badge/Competition-Zalo%20AI%20Challenge%202026-brightgreen)](https://challenge.zalo.ai/)
+[![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.2+-ee4c2c?logo=pytorch)](https://pytorch.org/)
+[![SLM](https://img.shields.io/badge/SLM-Qwen2.5_3B-blueviolet)](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
+[![ASR](https://img.shields.io/badge/ASR-PhoWhisper_large-green)](https://huggingface.co/vinai/phowhisper-large)
+[![Docker](https://img.shields.io/badge/Docker-Offline-2496ED?logo=docker)](https://www.docker.com/)
+[![Zalo AI Challenge](https://img.shields.io/badge/Zalo_AI_Challenge-2026-brightgreen)](https://challenge.zalo.ai/)
 
 ---
 
 ## 📋 Tổng quan dự án
 
-Dự án cung cấp một đường ống xử lý (pipeline) hoàn chỉnh, tự động và độc lập cho bài toán **LifeMate — Trợ lý điều khiển cuộc sống thông minh** thuộc khuôn khổ cuộc thi **Zalo AI Challenge 2026**.
+Dự án cung cấp một pipeline hoàn chỉnh, tự động và độc lập cho bài toán **LifeMate** thuộc khuôn khổ cuộc thi **Zalo AI Challenge 2026**.
 
 Mục tiêu của bài toán là tiếp nhận chuỗi âm thanh hội thoại đời thực bằng tiếng Việt, nhận dạng yêu cầu người dùng, tương tác với các ứng dụng đã cài đặt (nhà thông minh, ngân hàng, thời tiết, giao thông...) và thực thi các thao tác (`tool_calls`) chính xác nhằm đồng bộ trạng thái hệ thống (`state_hash`).
 
