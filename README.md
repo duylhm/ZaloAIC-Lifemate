@@ -2,10 +2,10 @@
 
 [![Python](https://img.shields.io/badge/Python-3.10+-blue?logo=python)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.2+-ee4c2c?logo=pytorch)](https://pytorch.org/)
-[![SLM](https://img.shields.io/badge/SLM-Qwen2.5_3B-purple?style=flat)](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
-[![ASR](https://img.shields.io/badge/ASR-PhoWhisper-green?style=flat)](https://huggingface.co/vinai/phowhisper-large)
-[![Docker](https://img.shields.io/badge/Docker-Offline-2496ed?logo=docker&style=flat)](https://www.docker.com/)
-[![Zalo AI Challenge](https://img.shields.io/badge/Zalo_AI_2026-LifeMate-brightgreen?style=flat)](https://challenge.zalo.ai/)
+[![SLM](https://img.shields.io/badge/SLM-Qwen2.5-purple)](https://huggingface.co/Qwen/Qwen2.5-3B-Instruct)
+[![ASR](https://img.shields.io/badge/ASR-PhoWhisper-green)](https://huggingface.co/vinai/phowhisper-large)
+[![Docker](https://img.shields.io/badge/Docker-Offline-blue?logo=docker)](https://www.docker.com/)
+[![Competition](https://img.shields.io/badge/Competition-LifeMate-brightgreen)](https://challenge.zalo.ai/)
 
 ---
 
