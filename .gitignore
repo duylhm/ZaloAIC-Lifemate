@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Model checkpoints and weights
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Caches
+.cache/
+hf_cache/
+*.jsonl.cache
+
+# Submission files
+submission*.jsonl
+*.log
