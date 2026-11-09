@@ -23,37 +23,50 @@ def resolve_environment():
     is_colab = os.path.exists("/content")
     
     if is_colab:
-        # Check Drive mount
         drive_dir = Path("/content/drive/MyDrive")
         if not drive_dir.exists():
             print("[Info] Google Drive not mounted at /content/drive/MyDrive.")
         
-        # Check if train+public_test is unzipped
-        data_root = Path("/content/data/train+public_test")
-        if not data_root.exists():
-            # Find zip file on Drive
+        candidates = [
+            Path("/content/data/train+public_test/public_test"),
+            Path("/content/data/public_test"),
+            Path("/content/train+public_test/public_test"),
+            Path("/content/public_test")
+        ]
+        test_dir = None
+        for c in candidates:
+            if (c / "public_test.jsonl").exists():
+                test_dir = c
+                break
+
+        if test_dir is None:
+            # Look for zip file on Drive or /content
             zips = glob.glob("/content/drive/MyDrive/**/train+public_test.zip", recursive=True)
             if not zips:
                 zips = glob.glob("/content/drive/MyDrive/*train+public_test*.zip")
+            if not zips:
+                zips = glob.glob("/content/*train+public_test*.zip")
             if zips:
                 zip_path = zips[0]
                 print(f"[Setup] Unzipping {zip_path} to /content/data...")
                 os.makedirs("/content/data", exist_ok=True)
                 os.system(f'unzip -q "{zip_path}" -d /content/data')
-            else:
-                # Look in current directory or /content
-                local_zips = glob.glob("/content/*train+public_test*.zip")
-                if local_zips:
-                    os.system(f'unzip -q "{local_zips[0]}" -d /content/data')
-        
-        test_dir = data_root / "public_test" if data_root.exists() else Path("/content/data/public_test")
+            for c in candidates:
+                if (c / "public_test.jsonl").exists():
+                    test_dir = c
+                    break
+
+        if test_dir is None:
+            raise FileNotFoundError("Không tìm thấy thư mục public_test (public_test.jsonl)!")
+
+        data_root = test_dir.parent
         output_path = Path("/content/submission.jsonl")
         drive_output = drive_dir / "submission.jsonl" if drive_dir.exists() else None
     else:
-        # Local Windows/Linux path
         base = Path(__file__).resolve().parent
-        data_root = base / "data" / "train+public_test"
-        test_dir = base / "data" / "public_test" if not data_root.exists() else data_root / "public_test"
+        downloads = Path(os.path.expanduser("~")) / "Downloads" / "train+public_test" / "train+public_test" / "public_test"
+        test_dir = downloads if downloads.exists() else base / "data" / "public_test"
+        data_root = test_dir.parent
         output_path = base / "submission.jsonl"
         drive_output = None
 
@@ -102,7 +115,7 @@ def filter_catalog(catalog_dict: dict, installed_apps: set) -> list[dict]:
 
 def build_system_prompt(filtered_tools: list[dict], current_state: dict) -> str:
     tools_str = json.dumps(filtered_tools, ensure_ascii=False, indent=1)
-    compact_state = {k: v for k, v in current_state.items() if v}
+    compact_state = {k: v for k, v in current_state.items() if v and k != "_meta"}
     state_str = json.dumps(compact_state, ensure_ascii=False)
     
     return f"""Bạn là trợ lý AI LifeMate trong Zalo AI Challenge 2026.
@@ -199,6 +212,7 @@ def main():
     parser = argparse.ArgumentParser(description="Run LifeMate Offline Inference")
     parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--force", action="store_true", help="Bỏ qua checkpoint cũ, chạy lại toàn bộ từ đầu")
     args = parser.parse_args()
 
     env_info = resolve_environment()
@@ -243,7 +257,10 @@ def main():
     results = []
     done_ids = set()
     source_to_check = drive_output if (drive_output and drive_output.exists()) else output_path
-    if source_to_check.exists():
+
+    if args.force:
+        print("[Checkpoint] Cờ --force được kích hoạt: Bỏ qua submission cũ, suy luận mới 100% toàn bộ mẫu!")
+    elif source_to_check.exists():
         try:
             with open(source_to_check, "r", encoding="utf-8") as f:
                 for line in f:

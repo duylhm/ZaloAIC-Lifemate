@@ -26,18 +26,37 @@ def resolve_data_paths():
     """Auto-detect train data directory on Colab or Local."""
     is_colab = os.path.exists("/content")
     if is_colab:
-        # Check if train+public_test is unzipped
-        root = Path("/content/data/train+public_test/train")
-        if not root.exists():
+        candidates = [
+            Path("/content/data/train+public_test/train"),
+            Path("/content/data/train"),
+            Path("/content/train+public_test/train"),
+            Path("/content/train")
+        ]
+        train_dir = None
+        for c in candidates:
+            if (c / "train.jsonl").exists():
+                train_dir = c
+                break
+
+        if train_dir is None:
+            # Check if train+public_test is unzipped
             zips = glob.glob("/content/drive/MyDrive/**/train+public_test.zip", recursive=True)
             if not zips:
                 zips = glob.glob("/content/drive/MyDrive/*train+public_test*.zip")
+            if not zips:
+                zips = glob.glob("/content/*train+public_test*.zip")
             if zips:
                 print(f"[Setup] Unzipping {zips[0]} to /content/data...")
                 os.makedirs("/content/data", exist_ok=True)
                 os.system(f'unzip -q "{zips[0]}" -d /content/data')
-        
-        train_dir = Path("/content/data/train+public_test/train")
+            for c in candidates:
+                if (c / "train.jsonl").exists():
+                    train_dir = c
+                    break
+
+        if train_dir is None:
+            raise FileNotFoundError("Không tìm thấy thư mục train (train.jsonl). Vui lòng đảm bảo file zip đã có trên Drive hoặc /content!")
+
         output_dir = Path("/content/drive/MyDrive/qwen2.5_3b_lifemate_lora")
     else:
         base = Path(__file__).resolve().parent
@@ -188,7 +207,7 @@ def main():
         device_map="auto",
         trust_remote_code=True
     )
-    model = prepare_model_for_kbit_training(model)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
     # 3. LoRA Config (All projection matrices)
     peft_config = LoraConfig(
@@ -202,28 +221,23 @@ def main():
     model = get_peft_model(model, peft_config)
     model.print_trainable_parameters()
 
-    # 4. Prepare Dataset
-    dataset = prepare_sft_dataset(train_dir, tokenizer, max_length=2048)
-    # 90% train, 10% validation
-    split_dataset = dataset.train_test_split(test_size=0.1, seed=42)
-    train_data = split_dataset["train"]
-    eval_data = split_dataset["test"]
-    print(f"[Dataset] Train split: {len(train_data)} | Eval split: {len(eval_data)}")
+    # 4. Prepare Dataset (All 1,545 dialogues from train.jsonl)
+    train_data = prepare_sft_dataset(train_dir, tokenizer, max_length=2048)
+    print(f"[Dataset] Full training set: {len(train_data)} dialogues.")
 
     # 5. Training Arguments
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
         gradient_accumulation_steps=4, # Effective batch size = 8
         learning_rate=2e-4,
         num_train_epochs=2,
         fp16=True,
         optim="paged_adamw_8bit",
         logging_steps=10,
-        eval_strategy="epoch",
-        save_strategy="epoch",
-        save_total_limit=2,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        save_strategy="no",
         warmup_ratio=0.05,
         lr_scheduler_type="cosine",
         report_to="none"
@@ -240,7 +254,6 @@ def main():
         model=model,
         args=training_args,
         train_dataset=train_data,
-        eval_dataset=eval_data,
         data_collator=data_collator,
         tokenizer=tokenizer
     )
