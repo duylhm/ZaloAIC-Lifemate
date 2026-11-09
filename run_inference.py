@@ -281,6 +281,20 @@ def main():
         quantization_config=bnb_config,
         device_map="auto"
     )
+
+    # Check if a fine-tuned LoRA adapter exists on Drive or local
+    adapter_candidates = [
+        Path("/content/drive/MyDrive/qwen2.5_3b_lifemate_lora"),
+        base_dir / "qwen2.5_3b_lifemate_lora"
+    ]
+    for adapt in adapter_candidates:
+        if adapt.exists() and (adapt / "adapter_config.json").exists():
+            print(f"[Model] 🔥 Phát hiện LoRA Adapter đã huấn luyện tại: {adapt}! Đang nạp trọng số fine-tune...")
+            from peft import PeftModel
+            model = PeftModel.from_pretrained(model, str(adapt))
+            print(f"[Model] Nạp LoRA Adapter thành công! Sẵn sàng suy luận độ chính xác cao.")
+            break
+
     model.eval()
     vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
     print(f"[Model] Ready! GPU VRAM in use: {vram_gb:.2f} GB (Over 12.5 GB free).\n")
