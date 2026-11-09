@@ -238,7 +238,7 @@ def main():
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
         save_strategy="no",
-        warmup_ratio=0.05,
+        warmup_steps=10,
         lr_scheduler_type="cosine",
         report_to="none"
     )
