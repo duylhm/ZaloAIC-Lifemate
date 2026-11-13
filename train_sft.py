@@ -6,9 +6,11 @@ import argparse
 import inspect
 import json
 import math
+import os
 import random
-import sys
 from pathlib import Path
+
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from src.data_utils import REPO_ROOT, read_jsonl, resolve_data_root
 from src.prompt_builder import load_catalog_dict
@@ -178,6 +180,7 @@ def main() -> None:
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         quantization_config=bnb_config,
+        torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
         device_map="auto",
         trust_remote_code=True,
     )
