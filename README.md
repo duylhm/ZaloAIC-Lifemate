@@ -1,24 +1,32 @@
 # Zalo AI Challenge 2026 — LifeMate
 
-Offline Voice-to-Action Agentic Pipeline (<5B SLM + Offline Vietnamese ASR), 100% compliant with BTC rules:
-- **Zero `state.json` leakage**: device state is only accessed via multi-turn `read` tool calls against `zaic_tools.ToolEnv`.
-- **Pre-call Guardrail**: validates every call with `env.validate(name, args)` before `env.call(name, args)` so invalid arguments never pollute `env.get_tool_calls()`, feeding validation feedback back to the agent for self-correction.
-- **Unseen-App Generalization**: compact typed tool signatures + Causal DAG step decomposition + App-Dropout + schema shuffling + strict assistant-only loss masking.
+Pipeline **Offline Voice-to-Action Agentic** (`SLM < 5B` + `Offline Vietnamese ASR`) tuân thủ 100% thể lệ BTC:
 
-## Structure
-- `src/prompt_builder.py` — Compact schema serializer (`format_compact_tool`), temporal anchors, full `history` turn serialization.
-- `src/trajectory.py` — Causal DAG step grouping (`group_trajectory_into_steps`), App-Dropout, safe phonetic verb-noise augmentation, ChatML formatting, and exact multi-turn assistant loss masking.
-- `src/guardrails.py` — `<think>` / fence stripping, JSON extraction, schema-aware coercion (thousands separators, Vietnamese time/date normalization), and gold defaults.
-- `src/agent.py` — `LifeMateAgent` ReAct loop + `HFTransformersBackend` (4-bit NF4 + LoRA + Qwen3 `enable_thinking=False`), `OpenAICompatibleBackend`, `HeuristicBackend`, `NoopBackend`.
-- `src/asr.py` — `OfflineASR` (`vinai/PhoWhisper-large` / `faster-whisper`) with 16kHz mono resampling, request + `_u*` history transcription, and dual-cache fallback.
-- `scripts/prepare_splits.py` — Generates `splits/val_unseen.json` (142 unseen-app samples across `bike_rental`, `exchange_rate`, `medication`, `package_tracking`), `splits/val_indomain.json` (100 stratified samples), and `splits/val_all.json`.
-- `scripts/benchmark_asr.py` — Colab T4 CER/WER benchmark on `train` audio & cache regeneration.
-- `scripts/inspect_errors.py` — Per-failure-bucket diagnostics via `evaluate.py`.
-- `train_sft.py` — QLoRA trainer supporting `--split-mode val` and `--split-mode full`.
-- `run_inference.py` — Resumable ReAct inference + `zaic_tools --validate` + optional `evaluate.py`.
-- `docker/Dockerfile` & `docker/run.sh` — Offline (`HF_HUB_OFFLINE=1`, `--no-cache`) Private Test container.
+- **Không rò rỉ `state.json`:** Agent chỉ truy xuất trạng thái thiết bị qua các lượt gọi `read` tool trên `zaic_tools.ToolEnv`.
+- **Guardrail kiểm tra trước khi gọi (`env.validate` → `env.call`):** Chặn và tự sửa tham số sai schema trước khi gọi `env.call(...)`, tránh làm bẩn `env.get_tool_calls()`, đồng thời trả `schema_validation_error` lại cho model tự sửa ở lượt kế tiếp.
+- **Tổng quát hóa sang Unseen Apps:** Nén chữ ký tool có kiểu dữ liệu (`format_compact_tool`), phân rã chuỗi hành động theo Causal DAG, tăng cường **App-Dropout**, xáo trộn thứ tự tool và tính **Prompt Loss Masking** chỉ trên các lượt trả lời của assistant.
 
-## Local Workflow (Windows CPU)
+---
+
+## Cấu trúc Thư mục
+
+- `src/prompt_builder.py` — Chuẩn hóa `time_anchors`, giữ đầy đủ `history` (`calls` + `results`), hỗ trợ `asr_alt` và nén schema theo `installed_apps` + `sys.ask_missing_info`.
+- `src/trajectory.py` — Gom `tool_calls` thành các bước nhân quả (`group_trajectory_into_steps`), App-Dropout, nhiễu âm vị tiếng Việt an toàn, chuyển ChatML và masking loss (`labels = -100`) trên prompt/tool results.
+- `src/guardrails.py` — Lọc `<think>` / markdown fence, tách JSON, ép kiểu số nguyên tiếng Việt (`1.200.000` → `1200000`), chuẩn hóa `date` / `date-time` / `time` và bỏ tham số mặc định thừa.
+- `src/agent.py` — Vòng lặp ReAct `LifeMateAgent` + backend `HFTransformersBackend` (4-bit NF4, LoRA, hỗ trợ Qwen3 `enable_thinking=False`), `OpenAICompatibleBackend`, `HeuristicBackend`, `NoopBackend`.
+- `src/asr.py` — `OfflineASR` (`vinai/PhoWhisper-large` / `faster-whisper`) hỗ trợ resample 16kHz mono, nhận dạng cả lượt chính và lịch sử `_u*.wav`, kết hợp dual-cache.
+- `src/data_utils.py` — Tự động dò thư mục dữ liệu trên máy local Windows / Google Colab và tiện ích đọc/ghi JSONL.
+- `scripts/prepare_splits.py` — Tạo bộ kiểm thử nội bộ tại `splits/`: `val_unseen.json` (`142` mẫu thuộc 4 app ẩn: `bike_rental`, `exchange_rate`, `medication`, `package_tracking`), `val_indomain.json` (`100` mẫu phân tầng) và `val_all.json`.
+- `scripts/benchmark_asr.py` — Benchmark CER/WER ASR tiếng Việt trên audio tập `train` và tái tạo cache `public_test` trên Colab T4.
+- `scripts/inspect_errors.py` — Phân tích các ca lỗi theo từng nhóm bằng `evaluate.py`.
+- `train_sft.py` — Huấn luyện QLoRA multi-turn SFT (`--split-mode val` và `--split-mode full`).
+- `run_inference.py` — Suy luận ReAct có checkpoint/resume, tự chạy `zaic_tools --validate` và tùy chọn `--eval`.
+- `docker/Dockerfile` & `docker/run.sh` — Đóng gói Docker chạy offline hoàn toàn (`HF_HUB_OFFLINE=1`, `--no-cache`) cho `private_test`.
+
+---
+
+## Quy trình Kiểm thử Tại Local (Windows PowerShell / CPU)
+
 ```powershell
 python -m unittest tests/test_pipeline.py -v
 python scripts/prepare_splits.py
@@ -26,13 +34,23 @@ python run_inference.py --split train --ids-file splits/val_all.json --backend n
 python run_inference.py --split train --ids-file splits/val_all.json --backend heuristic --force --output outputs/val_heuristic.jsonl --eval
 ```
 
-## Google Colab T4 Workflow
-Open [notebooks/LifeMate_Colab_Inference.ipynb](notebooks/LifeMate_Colab_Inference.ipynb), mount Drive with `train+public_test.zip`, and run cells sequentially:
-1. Validate QLoRA (`Qwen/Qwen3-4B` or `Qwen/Qwen2.5-3B-Instruct`) on Unseen-App CV (`splits/val_all.json`).
-2. Train `--split-mode full` and generate `submission.jsonl` (`634/634` rows, schema-validated).
+---
 
-## Offline Docker Build & Run
-Copy trained LoRA weights into `adapter/`, then build and run offline:
+## Quy trình Fine-tune & Suy luận Trên Google Colab (GPU T4)
+
+Mở notebook [notebooks/LifeMate_Colab_Inference.ipynb](notebooks/LifeMate_Colab_Inference.ipynb) trên Google Colab (chọn Runtime **T4 GPU**), mount Google Drive chứa `train+public_test.zip` và chạy tuần tự các cell:
+
+1. **Cell 1–2 (`setup-cell`, `config-cell`):** Clone/pull repo, cài thư viện, giải nén dữ liệu và chọn `MODEL_ID` (`Qwen/Qwen3-4B` hoặc `Qwen/Qwen2.5-3B-Instruct`).
+2. **Cell 3 (`asr-bench-cell`, tùy chọn):** Đo CER/WER giữa `PhoWhisper-large` và `whisper-large-v3-turbo` trên 50 file `.wav` tập `train`.
+3. **Cell 4–5 (`zeroshot-val-cell`, `train-eval-val-cell`):** Fine-tune QLoRA (`--split-mode val`) trên `1,303` mẫu, chấm điểm trên `142` mẫu Unseen-App + `100` mẫu In-Domain qua `evaluate.py` và soi lỗi với `inspect_errors.py`.
+4. **Cell 6 (`full-train-infer-cell`):** Fine-tune QLoRA (`--split-mode full`) trên toàn bộ `1,545` mẫu → infer `public_test` (`634` mẫu) → tự động backup sang Google Drive, kiểm tra `zaic_tools --validate` và tải `submission.jsonl`.
+
+---
+
+## Build & Chạy Docker Offline (`private_test`)
+
+Copy weights LoRA đã train vào thư mục `adapter/`, sau đó build và chạy container ở chế độ không mạng (`--network none`):
+
 ```bash
 docker build -f docker/Dockerfile -t lifemate-agent .
 docker run --rm --gpus all --network none -v /path/to/private_test:/data -v /path/to/out:/output lifemate-agent /data /output/submission.jsonl private_test
