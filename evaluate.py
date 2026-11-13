@@ -196,11 +196,54 @@ def score_sample(
     }
 
 
+def _classify_failure(
+    sub_calls: list[dict],
+    gold_calls: list[dict],
+    state_ok: bool,
+    m: int,
+) -> str:
+    """Categorize primary failure reason for diagnostics without altering official scoring."""
+    g_len = len(gold_calls)
+    s_len = len(sub_calls)
+    if g_len == 0:
+        return "ok" if s_len == 0 else "false_positive_on_oos"
+    if m == g_len and s_len == g_len and state_ok:
+        return "ok"
+    if not state_ok and m == g_len and s_len == g_len:
+        return "state_mismatch_despite_tool_match"
+    sub_names = sorted(c.get("name", "") for c in sub_calls)
+    gold_names = sorted(c.get("name", "") for c in gold_calls)
+    if sub_names != gold_names:
+        if any(c.get("name") == "sys.ask_missing_info" for c in gold_calls) != any(
+            c.get("name") == "sys.ask_missing_info" for c in sub_calls
+        ):
+            return "ask_missing_mismatch"
+        return "tool_name_or_count_mismatch"
+    if not state_ok:
+        return "arg_and_state_mismatch"
+    return "arg_or_fuzzy_mismatch"
+
+
+def _load_ids_and_apps(ids_file: Path | None) -> tuple[set[str] | None, set[str] | None]:
+    if not ids_file:
+        return None, None
+    data = json.loads(ids_file.read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return set(data), None
+    if isinstance(data, dict):
+        ids = data.get("ids") or data.get("sample_ids") or []
+        apps = data.get("holdout_apps") or data.get("unseen_apps") or []
+        return (set(ids) if ids else None), (set(apps) if apps else None)
+    return None, None
+
+
 def evaluate_predictions(
     data_root: Path,
     split: str,
     submission_path: Path,
     limit: int | None = None,
+    sample_ids: set[str] | None = None,
+    unseen_apps: set[str] | None = None,
 ) -> dict:
     """Evaluate a submission.jsonl file against gold labels of `split` (e.g. 'train')."""
     sys.path.insert(0, str(data_root / split))
@@ -217,15 +260,23 @@ def evaluate_predictions(
 
     results = []
     by_cat: dict[str, list[float]] = {}
+    failure_counts: dict[str, int] = {}
+    unseen_scores: list[float] = []
+    indomain_scores: list[float] = []
 
     with open(data_root / split / f"{split}.jsonl", encoding="utf-8") as f:
-        for idx, line in enumerate(f):
+        kept = 0
+        for line in f:
             if not line.strip():
                 continue
-            if limit is not None and idx >= limit:
-                break
             item = json.loads(line)
             qid = item["id"]
+            if sample_ids is not None and qid not in sample_ids:
+                continue
+            if limit is not None and kept >= limit:
+                break
+            kept += 1
+
             gold_calls = item["label"]["tool_calls"]
 
             # Compute gold state_hash via ToolEnv replay
@@ -246,6 +297,21 @@ def evaluate_predictions(
             res = score_sample(sub_calls, replayed_sub_hash, gold_calls, gold_hash, fuzzy_map)
             res["id"] = qid
             res["submitted_hash_matches_replay"] = (sub.get("state_hash") == replayed_sub_hash)
+            reason = _classify_failure(sub_calls, gold_calls, res["state_match"], res["M"])
+            res["failure_reason"] = reason
+            failure_counts[reason] = failure_counts.get(reason, 0) + 1
+
+            used_apps = {c.get("name", "").split(".")[0] for c in gold_calls}
+            for turn in item.get("history") or []:
+                for tc in turn.get("tool_calls") or []:
+                    used_apps.add(tc.get("name", "").split(".")[0])
+            used_apps -= {"sys", ""}
+            if unseen_apps is not None:
+                if used_apps & unseen_apps:
+                    unseen_scores.append(res["score"])
+                else:
+                    indomain_scores.append(res["score"])
+
             results.append(res)
             by_cat.setdefault(res["category"], []).append(res["score"])
 
@@ -253,12 +319,14 @@ def evaluate_predictions(
     final_score = 100.0 * sum(r["score"] for r in results) / n if n else 0.0
     tiebreak_f1 = 100.0 * sum(r["f1_unconditional"] for r in results) / n if n else 0.0
     state_acc = 100.0 * sum(1 for r in results if r["state_match"]) / n if n else 0.0
+    replay_hash_acc = 100.0 * sum(1 for r in results if r["submitted_hash_matches_replay"]) / n if n else 0.0
 
-    summary = {
+    summary: dict = {
         "samples": n,
         "final_score": round(final_score, 4),
         "tiebreak_tool_f1": round(tiebreak_f1, 4),
         "state_match_rate": round(state_acc, 4),
+        "submitted_hash_replay_match_rate": round(replay_hash_acc, 4),
         "by_category": {
             k: {
                 "count": len(v),
@@ -266,7 +334,17 @@ def evaluate_predictions(
             }
             for k, v in sorted(by_cat.items())
         },
+        "failure_breakdown": dict(sorted(failure_counts.items())),
     }
+    if unseen_apps is not None:
+        summary["unseen_app_slice"] = {
+            "count": len(unseen_scores),
+            "score": round(100.0 * sum(unseen_scores) / len(unseen_scores), 4) if unseen_scores else 0.0,
+        }
+        summary["in_domain_slice"] = {
+            "count": len(indomain_scores),
+            "score": round(100.0 * sum(indomain_scores) / len(indomain_scores), 4) if indomain_scores else 0.0,
+        }
     return summary
 
 
@@ -276,7 +354,16 @@ if __name__ == "__main__":
     ap.add_argument("--split", default="train")
     ap.add_argument("--submission", type=Path, help="Path to submission.jsonl (omit to run gold self-check)")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--ids-file", type=Path, default=None, help="JSON list or {ids, holdout_apps} dict to filter samples")
+    ap.add_argument("--unseen-apps", default=None, help="Comma-separated unseen app names for slice reporting")
     args = ap.parse_args()
+
+    filter_ids, file_unseen = _load_ids_and_apps(args.ids_file)
+    unseen_apps = (
+        {a.strip() for a in args.unseen_apps.split(",") if a.strip()}
+        if args.unseen_apps
+        else file_unseen
+    )
 
     if args.submission is None:
         # Self-test: generate gold submission in memory and verify 100.0 score
@@ -284,11 +371,17 @@ if __name__ == "__main__":
         from zaic_tools import ToolEnv
 
         tmp_sub = args.root / "gold_check_sub.jsonl"
+        kept = 0
         with open(args.root / args.split / f"{args.split}.jsonl", encoding="utf-8") as fin, open(tmp_sub, "w", encoding="utf-8") as fout:
-            for idx, line in enumerate(fin):
-                if args.limit and idx >= args.limit:
-                    break
+            for line in fin:
+                if not line.strip():
+                    continue
                 item = json.loads(line)
+                if filter_ids is not None and item["id"] not in filter_ids:
+                    continue
+                if args.limit and kept >= args.limit:
+                    break
+                kept += 1
                 env = ToolEnv(args.split, item["id"], root=args.root)
                 for tc in item["label"]["tool_calls"]:
                     env.call(tc["name"], tc.get("arguments") or {})
@@ -297,10 +390,24 @@ if __name__ == "__main__":
                     "tool_calls": env.get_tool_calls(),
                     "state_hash": env.get_state_hash(),
                 }, ensure_ascii=False) + "\n")
-        summary = evaluate_predictions(args.root, args.split, tmp_sub, limit=args.limit)
+        summary = evaluate_predictions(
+            args.root,
+            args.split,
+            tmp_sub,
+            limit=args.limit,
+            sample_ids=filter_ids,
+            unseen_apps=unseen_apps,
+        )
         tmp_sub.unlink(missing_ok=True)
         print("Gold Self-Check Summary:")
         print(json.dumps(summary, indent=2, ensure_ascii=False))
     else:
-        summary = evaluate_predictions(args.root, args.split, args.submission, limit=args.limit)
+        summary = evaluate_predictions(
+            args.root,
+            args.split,
+            args.submission,
+            limit=args.limit,
+            sample_ids=filter_ids,
+            unseen_apps=unseen_apps,
+        )
         print(json.dumps(summary, indent=2, ensure_ascii=False))

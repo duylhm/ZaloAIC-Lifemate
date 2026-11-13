@@ -1,27 +1,36 @@
-# Zalo AI Challenge 2026 — LifeMate Offline Submission Dockerfile
-# Complies with BTC offline guidelines: SLM <5B, Context <=16K, no internet access during inference.
+FROM pytorch/pytorch:2.4.1-cuda12.1-cudnn9-runtime
 
-FROM pytorch/pytorch:2.2.1-cuda12.1-cudnn8-runtime
-
-ENV DEBIAN_FRONTEND=noninteractive
-ENV PYTHONUNBUFFERED=1
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/app/hf_cache \
+    HF_HUB_ENABLE_HF_TRANSFER=0
 
 WORKDIR /app
 
-# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 \
-    git \
+    ffmpeg libsndfile1 git \
     && rm -rf /var/lib/apt/lists/*
 
-# Install python dependencies
 COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy source code and local weights
-COPY src/ /app/src/
-COPY evaluate.py /app/evaluate.py
+# Build-time offline weight prefetch (override BASE_MODEL / ASR_MODEL via --build-arg)
+ARG BASE_MODEL="Qwen/Qwen3-4B"
+ARG ASR_MODEL="vinai/PhoWhisper-large"
+ENV LIFEMATE_BASE_MODEL="${BASE_MODEL}" \
+    LIFEMATE_ASR_MODEL="${ASR_MODEL}"
+
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('${BASE_MODEL}'); snapshot_download('${ASR_MODEL}')"
+
+COPY src /app/src
+COPY run_inference.py evaluate.py /app/
 COPY docker/run.sh /app/run.sh
-RUN chmod +x /app/run.sh
+# Place fine-tuned LoRA adapter files in ./adapter/ before docker build
+COPY adapter /app/adapter
+
+RUN sed -i 's/\r$//' /app/run.sh && chmod +x /app/run.sh
+
+ENV HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1
 
 ENTRYPOINT ["/app/run.sh"]

@@ -1,401 +1,253 @@
-"""Zalo AI Challenge 2026 — LifeMate: Professional Inference Runner
-Runs offline SLM (Qwen2.5-3B-Instruct 4-bit NF4) with deterministic guardrails,
-ToolEnv replay state calculation, and auto-resume checkpointing.
-"""
-import os
-import sys
-import json
-import glob
-import time
-import shutil
+"""Compliant Multi-Turn ReAct Inference Pipeline for LifeMate (Local CV, Colab T4, Offline Docker)."""
+
+from __future__ import annotations
+
 import argparse
+import json
+import os
+import shutil
+import sys
+import time
 from pathlib import Path
 
-# Enable memory fragmentation avoidance in PyTorch
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+from src.agent import (
+    HFTransformersBackend,
+    HeuristicBackend,
+    LifeMateAgent,
+    NoopBackend,
+    OpenAICompatibleBackend,
+)
+from src.asr import OfflineASR, hydrate_sample_transcripts, load_asr_cache
+from src.data_utils import REPO_ROOT, read_jsonl, resolve_data_root
+from src.prompt_builder import load_catalog_dict
 
-import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-import rapidfuzz
 
-def resolve_environment():
-    """Auto-detect paths on Colab or Local machine."""
-    is_colab = os.path.exists("/content")
-    
-    if is_colab:
-        drive_dir = Path("/content/drive/MyDrive")
-        if not drive_dir.exists():
-            print("[Info] Google Drive not mounted at /content/drive/MyDrive.")
-        
-        candidates = [
-            Path("/content/data/train+public_test/public_test"),
-            Path("/content/data/public_test"),
-            Path("/content/train+public_test/public_test"),
-            Path("/content/public_test")
+def _build_backend(args: argparse.Namespace):
+    if args.backend == "noop":
+        return NoopBackend()
+    if args.backend == "heuristic":
+        return HeuristicBackend()
+    if args.backend == "openai":
+        return OpenAICompatibleBackend(
+            base_url=args.base_url,
+            model=args.model,
+        )
+    return HFTransformersBackend(
+        model_id=args.model,
+        adapter_path=args.adapter,
+        load_in_4bit=not args.no_4bit,
+        max_new_tokens=args.max_new_tokens,
+        local_files_only=args.offline,
+    )
+
+
+def _needs_live_asr(
+    rows: list[dict],
+    split_dir: Path,
+    split_name: str,
+    primary_cache: dict[str, str],
+    no_cache: bool,
+) -> bool:
+    for r in rows:
+        refs = [r.get("audio")] + [t.get("audio") for t in (r.get("history") or []) if t.get("role") == "user"]
+        existing_texts = [r.get("audio_text")] + [
+            t.get("audio_text") for t in (r.get("history") or []) if t.get("role") == "user"
         ]
-        test_dir = None
-        for c in candidates:
-            if (c / "public_test.jsonl").exists():
-                test_dir = c
-                break
-
-        if test_dir is None:
-            # Look for zip file on Drive or /content
-            zips = glob.glob("/content/drive/MyDrive/**/train+public_test.zip", recursive=True)
-            if not zips:
-                zips = glob.glob("/content/drive/MyDrive/*train+public_test*.zip")
-            if not zips:
-                zips = glob.glob("/content/*train+public_test*.zip")
-            if zips:
-                zip_path = zips[0]
-                print(f"[Setup] Unzipping {zip_path} to /content/data...")
-                os.makedirs("/content/data", exist_ok=True)
-                os.system(f'unzip -q "{zip_path}" -d /content/data')
-            for c in candidates:
-                if (c / "public_test.jsonl").exists():
-                    test_dir = c
-                    break
-
-        if test_dir is None:
-            raise FileNotFoundError("Không tìm thấy thư mục public_test (public_test.jsonl)!")
-
-        data_root = test_dir.parent
-        output_path = Path("/content/submission.jsonl")
-        drive_output = drive_dir / "submission.jsonl" if drive_dir.exists() else None
-    else:
-        base = Path(__file__).resolve().parent
-        downloads = Path(os.path.expanduser("~")) / "Downloads" / "train+public_test" / "train+public_test" / "public_test"
-        test_dir = downloads if downloads.exists() else base / "data" / "public_test"
-        data_root = test_dir.parent
-        output_path = base / "submission.jsonl"
-        drive_output = None
-
-    return {
-        "is_colab": is_colab,
-        "data_root": data_root,
-        "test_dir": test_dir,
-        "output_path": output_path,
-        "drive_output": drive_output
-    }
-
-def load_asr_cache(base_dir: Path, drive_dir: Path | None) -> dict:
-    """Load pre-computed ASR transcriptions to completely bypass audio model."""
-    candidates = [
-        base_dir / "asr_public_test_pho.json",
-        Path("/content/ZaloAIC-Lifemate/asr_public_test_pho.json"),
-        Path("/content/data/asr_public_test_pho.json"),
-    ]
-    if drive_dir and drive_dir.exists():
-        candidates.append(drive_dir / "asr_cache_public_test.json")
-
-    for p in candidates:
-        if p.exists():
-            try:
-                with open(p, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                print(f"[ASR] Loaded {len(cache)} cached audio transcriptions from {p.name}")
-                return cache
-            except Exception as e:
-                print(f"[ASR] Warning reading {p}: {e}")
-    return {}
-
-def filter_catalog(catalog_dict: dict, installed_apps: set) -> list[dict]:
-    """Filter catalog to only tools belonging to installed apps or sys."""
-    filtered = []
-    for app in catalog_dict.get("apps", []):
-        app_name = app.get("name", "")
-        if app_name in installed_apps or app_name == "sys":
-            for tool in app.get("tools", []):
-                filtered.append({
-                    "name": tool["name"],
-                    "description": tool.get("description", ""),
-                    "parameters": tool.get("parameters", {})
-                })
-    return filtered
-
-def build_system_prompt(filtered_tools: list[dict], current_state: dict) -> str:
-    tools_str = json.dumps(filtered_tools, ensure_ascii=False, indent=1)
-    compact_state = {k: v for k, v in current_state.items() if v and k != "_meta"}
-    state_str = json.dumps(compact_state, ensure_ascii=False)
-    
-    return f"""Bạn là trợ lý AI LifeMate trong Zalo AI Challenge 2026.
-Nhiệm vụ: Phân tích câu nói của người dùng và gọi các công cụ (tool_calls) phù hợp nhất.
-
-CÔNG CỤ ĐƯỢC PHÉP DÙNG:
-{tools_str}
-
-DATABASE STATE HIỆN TẠI CỦA THIẾT BỊ:
-{state_str}
-
-QUY TẮC CỐT LÕI (BẮT BUỘC TUÂN THỦ):
-1. OUT-OF-SCOPE HOẶC HỦY LỆNH ("thôi khỏi", "đừng làm gì"): trả về duy nhất mảng rỗng []
-2. CÂU HỎI ĐIỀU KIỆN THỜI TIẾT ("Nếu mai mưa thì... không mưa thì thôi"): CHỈ gọi duy nhất `weather.get_forecast`.
-3. KHÔNG ĐƯỢC TỰ BỊA ID: Lấy chính xác ID sự kiện/hóa đơn từ DATABASE STATE. Tham số hóa đơn là `source` ("bank" hoặc "ewallet"). Tham số nhắc nhở là `content` và `time`.
-4. ĐỊNH DẠNG ĐẦU RA: CHỈ trả về duy nhất một khối JSON array hợp lệ:
-[
-  {{"name": "tool.name", "arguments": {{"param": "val"}}}}
-]"""
-
-def build_user_prompt(sample: dict, audio_text: str) -> str:
-    ctx = sample.get("context", {})
-    curr_time = ctx.get("current_time", "")
-    user_prof = ctx.get("user_profile") or {}
-    history = sample.get("history", [])
-    
-    history_str = ""
-    if history:
-        turns = [f"- {h.get('role')}: {h.get('audio_text') or h.get('text') or ''}" for h in history]
-        history_str = "\nLịch sử hội thoại:\n" + "\n".join(turns)
-        
-    return f"""Thời gian hiện tại: {curr_time}
-User: {json.dumps(user_prof, ensure_ascii=False)}{history_str}
-Người dùng vừa nói: "{audio_text}"
-Hãy sinh JSON array các tool calls phù hợp:"""
-
-def parse_json_calls(raw_output: str) -> list[dict]:
-    import re
-    text = raw_output.strip()
-    m_code = re.search(r"```(?:json)?\s*(\[[\s\S]*?\])\s*```", text)
-    if m_code:
-        text = m_code.group(1).strip()
-    else:
-        m_arr = re.search(r"(\[[\s\S]*\])", text)
-        if m_arr:
-            text = m_arr.group(1).strip()
-    try:
-        data = json.loads(text)
-        if isinstance(data, list):
-            return [
-                {"name": str(c["name"]).strip(), "arguments": c.get("arguments") or {}}
-                for c in data if isinstance(c, dict) and "name" in c
-            ]
-    except Exception:
-        pass
-    return []
-
-def apply_guardrails(call: dict, current_state: dict) -> dict:
-    """Correct common parameter hallucinations and align with database state."""
-    name = call.get("name", "")
-    args = call.get("arguments") or {}
-
-    # 1. Bill payment source guardrail
-    if name == "bill_payment.pay":
-        src = str(args.get("source", "")).lower()
-        if "bank" in src:
-            args["source"] = "bank"
-        elif "wallet" in src:
-            args["source"] = "ewallet"
-        else:
-            args["source"] = "bank"
-
-    # 2. Fuzzy match IDs in database state
-    if "event_id" in args:
-        events = current_state.get("calendar", {}).get("events", [])
-        real_ids = [str(e.get("id")) for e in events if e.get("id")]
-        if real_ids and str(args["event_id"]) not in real_ids:
-            match = rapidfuzz.process.extractOne(str(args["event_id"]), real_ids)
-            if match and match[1] >= 60:
-                args["event_id"] = match[0]
-
-    if "bill_id" in args:
-        bills = current_state.get("bill_payment", {}).get("bills", [])
-        real_ids = [str(b.get("id")) for b in bills if b.get("id")]
-        if real_ids and str(args["bill_id"]) not in real_ids:
-            match = rapidfuzz.process.extractOne(str(args["bill_id"]), real_ids)
-            if match and match[1] >= 60:
-                args["bill_id"] = match[0]
-
-    call["arguments"] = args
-    return call
-
-def main():
-    parser = argparse.ArgumentParser(description="Run LifeMate Offline Inference")
-    parser.add_argument("--model_id", type=str, default="Qwen/Qwen2.5-3B-Instruct")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--force", action="store_true", help="Bỏ qua checkpoint cũ, chạy lại toàn bộ từ đầu")
-    args = parser.parse_args()
-
-    env_info = resolve_environment()
-    test_dir = env_info["test_dir"]
-    data_root = env_info["data_root"]
-    output_path = env_info["output_path"]
-    drive_output = env_info["drive_output"]
-
-    print("=" * 60)
-    print("🚀 LifeMate Pro Inference Pipeline (Qwen2.5-3B 4-bit NF4)")
-    print(f"Data directory:   {test_dir}")
-    print(f"Output target:    {output_path}")
-    if drive_output:
-        print(f"Drive backup:     {drive_output}")
-    print("=" * 60)
-
-    # Add test_dir to sys.path for zaic_tools
-    sys.path.insert(0, str(test_dir))
-    try:
-        from zaic_tools import ToolEnv, schema_validate
-    except ImportError:
-        print(f"[Error] Cannot import zaic_tools from {test_dir}. Make sure data is unzipped!")
-        sys.exit(1)
-
-    # 1. Load test samples
-    test_jsonl = test_dir / "public_test.jsonl"
-    with open(test_jsonl, "r", encoding="utf-8") as f:
-        samples = [json.loads(line) for line in f if line.strip()]
-    print(f"[Data] Loaded {len(samples)} public test samples.")
-
-    # 2. Load catalog
-    catalog_path = test_dir / "public_test_tools_catalog.json"
-    with open(catalog_path, "r", encoding="utf-8") as f:
-        catalog_dict = json.load(f)
-
-    # 3. Load pre-computed ASR cache (0 GPU memory, 0 wait time)
-    base_dir = Path(__file__).resolve().parent
-    drive_dir = Path("/content/drive/MyDrive") if env_info["is_colab"] else None
-    asr_cache = load_asr_cache(base_dir, drive_dir)
-
-    # 4. Resume check: read existing progress
-    results = []
-    done_ids = set()
-    source_to_check = drive_output if (drive_output and drive_output.exists()) else output_path
-
-    if args.force:
-        print("[Checkpoint] Cờ --force được kích hoạt: Bỏ qua submission cũ, suy luận mới 100% toàn bộ mẫu!")
-    elif source_to_check.exists():
-        try:
-            with open(source_to_check, "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.strip():
-                        row = json.loads(line)
-                        results.append(row)
-                        done_ids.add(row["id"])
-            print(f"[Checkpoint] Found existing progress! Already completed: {len(done_ids)}/{len(samples)} samples.")
-        except Exception as e:
-            print(f"[Checkpoint] Error reading checkpoint: {e}")
-            results, done_ids = [], set()
-
-    remaining_samples = [s for s in samples if s["id"] not in done_ids]
-    print(f"[Plan] Samples remaining to process: {len(remaining_samples)}")
-
-    if not remaining_samples:
-        print("🎉 All samples already completed! Nothing to run.")
-        if drive_output and not drive_output.exists():
-            shutil.copy(str(output_path), str(drive_output))
-        sys.exit(0)
-
-    # 5. Load Qwen2.5-3B in 4-bit NF4
-    print(f"\n[Model] Loading {args.model_id} in 4-bit NF4 (Occupies only ~2.1 GB VRAM)...")
-    tokenizer = AutoTokenizer.from_pretrained(args.model_id)
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-        bnb_4bit_quant_type="nf4"
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_id,
-        quantization_config=bnb_config,
-        device_map="auto"
-    )
-
-    # Check if a fine-tuned LoRA adapter exists on Drive or local
-    adapter_candidates = [
-        Path("/content/drive/MyDrive/qwen2.5_3b_lifemate_lora"),
-        base_dir / "qwen2.5_3b_lifemate_lora"
-    ]
-    for adapt in adapter_candidates:
-        if adapt.exists() and (adapt / "adapter_config.json").exists():
-            print(f"[Model] 🔥 Phát hiện LoRA Adapter đã huấn luyện tại: {adapt}! Đang nạp trọng số fine-tune...")
-            from peft import PeftModel
-            model = PeftModel.from_pretrained(model, str(adapt))
-            print(f"[Model] Nạp LoRA Adapter thành công! Sẵn sàng suy luận độ chính xác cao.")
-            break
-
-    model.eval()
-    vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-    print(f"[Model] Ready! GPU VRAM in use: {vram_gb:.2f} GB (Over 12.5 GB free).\n")
-
-    # 6. Run Inference Loop
-    start_time = time.time()
-    with open(output_path, "w", encoding="utf-8") as f_out:
-        # Re-write finished samples
-        for row in results:
-            f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
-        f_out.flush()
-
-        for idx, s in enumerate(samples, 1):
-            if s["id"] in done_ids:
+        for rel, txt in zip(refs, existing_texts):
+            if txt and not no_cache:
                 continue
+            if rel and (split_dir / rel).is_file():
+                norm = rel.replace("\\", "/").lstrip("/")
+                cached = primary_cache.get(f"{split_name}/{norm}") or primary_cache.get(norm)
+                if no_cache or not cached:
+                    return True
+    return False
 
-            rel = s.get("audio", "")
-            text = asr_cache.get(f"public_test/{rel}", "")
-            
-            env = ToolEnv("public_test", s["id"], root=data_root)
 
-            t_low = text.lower()
-            oos_words = ["khách sạn", "hotel", "homestay", "resort", "hộ chiếu", "visa", "bảo hiểm", "karaoke", "spa", "massage"]
-            oos = any(w in t_low for w in oos_words)
-            cancel = any(w in t_low for w in ["thôi khỏi", "đừng làm gì", "không cần nữa"]) and not any(w in t_low for w in ["chỉ cần xem", "xem giúp"])
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Run LifeMate ReAct inference and output submission.jsonl")
+    ap.add_argument("--root", type=Path, default=None)
+    ap.add_argument("--split", default="public_test")
+    ap.add_argument("--ids-file", type=Path, default=None, help="Optional JSON file restricting sample IDs")
+    ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--backend", choices=["hf", "openai", "noop", "heuristic"], default="hf")
+    ap.add_argument("--model", default="Qwen/Qwen3-4B")
+    ap.add_argument("--adapter", default=None, help="Optional LoRA adapter directory")
+    ap.add_argument("--base-url", default="http://localhost:8000/v1")
+    ap.add_argument("--no-4bit", action="store_true")
+    ap.add_argument("--max-new-tokens", type=int, default=512)
+    ap.add_argument("--max-turns", type=int, default=8)
+    ap.add_argument("--offline", action="store_true", help="Enforce HF_HUB_OFFLINE=1 & local_files_only=True")
+    ap.add_argument("--output", type=Path, default=REPO_ROOT / "submission.jsonl")
+    ap.add_argument("--mirror-path", type=Path, default=None, help="Optional backup copy (e.g. Google Drive)")
+    ap.add_argument("--force", action="store_true", help="Overwrite existing output instead of resuming")
+    ap.add_argument("--no-cache", action="store_true", help="Transcribe raw audio live instead of using ASR cache")
+    ap.add_argument("--asr-model", default="vinai/PhoWhisper-large")
+    ap.add_argument("--asr-beams", type=int, default=3)
+    ap.add_argument("--asr-cache", type=Path, default=None)
+    ap.add_argument("--asr-alt-cache", type=Path, default=None)
+    ap.add_argument("--no-alt-cache", action="store_true")
+    ap.add_argument("--eval", action="store_true", help="Run evaluate.py automatically if split has labels")
+    args = ap.parse_args()
 
-            if not oos and not cancel:
-                installed = set(s.get("context", {}).get("installed_apps", {}).keys())
-                filtered = filter_catalog(catalog_dict, installed)
-                sys_p = build_system_prompt(filtered, env.get_state())
-                usr_p = build_user_prompt(s, text)
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
-                messages = [
-                    {"role": "system", "content": sys_p},
-                    {"role": "user", "content": usr_p}
-                ]
-                prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-                inputs = tokenizer([prompt], return_tensors="pt", truncation=True, max_length=4096).to(model.device)
+    data_root = resolve_data_root(args.root, split=args.split)
+    split_dir = data_root / args.split
+    sys.path.insert(0, str(split_dir))
+    import zaic_tools  # noqa: E402
 
-                with torch.inference_mode():
-                    out_ids = model.generate(
-                        **inputs,
-                        max_new_tokens=256,
-                        do_sample=False,
-                        pad_token_id=tokenizer.eos_token_id
+    catalog_path = zaic_tools.catalog_path(args.split, data_root)
+    catalog_tools = load_catalog_dict(catalog_path)
+    rows = read_jsonl(split_dir / f"{args.split}.jsonl")
+
+    unseen_apps = None
+    if args.ids_file:
+        id_payload = json.loads(args.ids_file.read_text(encoding="utf-8"))
+        id_list = id_payload["ids"] if isinstance(id_payload, dict) else id_payload
+        if isinstance(id_payload, dict):
+            apps = id_payload.get("holdout_apps") or id_payload.get("unseen_apps")
+            unseen_apps = set(apps) if apps else None
+        id_set = set(id_list)
+        rows = [r for r in rows if r["id"] in id_set]
+    if args.limit is not None:
+        rows = rows[: args.limit]
+
+    # Resolve ASR caches & optional live ASR model.
+    default_primary = REPO_ROOT / "asr_public_test_pho.json"
+    default_alt = REPO_ROOT / "asr_public_test.json"
+    primary_cache_path = args.asr_cache or (default_primary if args.split == "public_test" else None)
+    alt_cache_path = None if (args.no_alt_cache or args.no_cache) else (
+        args.asr_alt_cache or (default_alt if args.split == "public_test" else None)
+    )
+
+    primary_cache = {} if args.no_cache else load_asr_cache(primary_cache_path)
+    alt_cache = {} if args.no_cache else load_asr_cache(alt_cache_path)
+
+    asr_engine = None
+    if _needs_live_asr(rows, split_dir, args.split, primary_cache, args.no_cache):
+        print(f"[ASR] Initializing live OfflineASR: {args.asr_model} (offline={args.offline})")
+        asr_engine = OfflineASR(
+            model_id=args.asr_model,
+            num_beams=args.asr_beams,
+            local_files_only=args.offline,
+        )
+    elif primary_cache:
+        print(f"[ASR] Using cached transcripts ({len(primary_cache)} entries, alt={len(alt_cache)})")
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    completed: dict[str, dict] = {}
+    if not args.force and args.output.is_file():
+        for rec in read_jsonl(args.output):
+            completed[rec["id"]] = rec
+        print(f"[Resume] Found {len(completed)}/{len(rows)} completed samples in {args.output}")
+    elif args.force and args.output.is_file():
+        args.output.unlink()
+
+    pending = [r for r in rows if r["id"] not in completed]
+    print(
+        f"[Inference] split={args.split} total={len(rows)} pending={len(pending)} "
+        f"backend={args.backend} model={args.model} adapter={args.adapter}"
+    )
+
+    if pending:
+        backend = _build_backend(args)
+        agent = LifeMateAgent(
+            backend=backend,
+            catalog_tools=catalog_tools,
+            max_turns=args.max_turns,
+        )
+
+        t0 = time.time()
+        with args.output.open("a", encoding="utf-8") as fout:
+            for idx, sample in enumerate(pending, start=1):
+                hydrated, asr_alt = hydrate_sample_transcripts(
+                    sample,
+                    split_dir=split_dir,
+                    split_name=args.split,
+                    asr_engine=asr_engine,
+                    primary_cache=primary_cache,
+                    alt_cache=alt_cache,
+                    overwrite_existing=args.no_cache,
+                )
+                env = zaic_tools.ToolEnv(args.split, sample["id"], root=data_root)
+                calls, state_hash = agent.run_sample(hydrated, env, asr_alt=asr_alt)
+
+                rec = {
+                    "id": sample["id"],
+                    "tool_calls": calls,
+                    "state_hash": state_hash,
+                }
+                completed[sample["id"]] = rec
+                fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                fout.flush()
+
+                if idx % 20 == 0 or idx == len(pending):
+                    elapsed = time.time() - t0
+                    rate = elapsed / idx
+                    eta = rate * (len(pending) - idx) / 60.0
+                    print(
+                        f"  [{len(completed)}/{len(rows)}] {rate:.2f}s/sample | "
+                        f"elapsed={elapsed/60:.1f}m | eta={eta:.1f}m"
                     )
-                    gen_ids = out_ids[0][inputs.input_ids.shape[1]:]
-                    resp_text = tokenizer.decode(gen_ids, skip_special_tokens=True)
+                    if args.mirror_path:
+                        args.mirror_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copy2(args.output, args.mirror_path)
 
-                del inputs, out_ids
-                pred_calls = parse_json_calls(resp_text)
+    # Rewrite in deterministic split order cleanly once complete.
+    ordered_rows = [completed[r["id"]] for r in rows if r["id"] in completed]
+    with args.output.open("w", encoding="utf-8") as fout:
+        for rec in ordered_rows:
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-                for c in pred_calls:
-                    c = apply_guardrails(c, env.get_state())
-                    val = env.validate(c["name"], c.get("arguments") or {})
-                    if val.get("ok"):
-                        env.call(c["name"], c.get("arguments") or {})
+    if args.mirror_path:
+        args.mirror_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(args.output, args.mirror_path)
 
-            row = {
-                "id": s["id"],
-                "tool_calls": env.get_tool_calls(),
-                "state_hash": env.get_state_hash()
-            }
-            results.append(row)
-            done_ids.add(s["id"])
-            f_out.write(json.dumps(row, ensure_ascii=False) + "\n")
-            f_out.flush()
+    print(f"[Saved] {len(ordered_rows)} rows -> {args.output}")
 
-            if len(done_ids) % 20 == 0 or len(done_ids) == len(samples):
-                torch.cuda.empty_cache()
-                if drive_output:
-                    try:
-                        shutil.copy(str(output_path), str(drive_output))
-                    except Exception:
-                        pass
-                elapsed = time.time() - start_time
-                print(f"[Progress] [{len(done_ids)}/{len(samples)}] samples | Elapsed: {elapsed/60:.1f}m")
+    # Run schema validation on every full non-filtered run, or validate calls directly.
+    if args.limit is None and args.ids_file is None:
+        import subprocess
 
-    # Final sync
-    if drive_output:
-        shutil.copy(str(output_path), str(drive_output))
-        print(f"\n[Done] Backup synced to Google Drive: {drive_output}")
+        cmd = [
+            sys.executable,
+            "-m",
+            "zaic_tools",
+            "--split",
+            args.split,
+            "--root",
+            str(data_root),
+            "--validate",
+            str(args.output),
+        ]
+        env_vars = os.environ.copy()
+        env_vars["PYTHONPATH"] = str(split_dir) + (os.pathsep + env_vars["PYTHONPATH"] if env_vars.get("PYTHONPATH") else "")
+        proc = subprocess.run(cmd, env=env_vars, capture_output=True, text=True)
+        print(f"[zaic_tools --validate] exit={proc.returncode}")
+        if proc.stdout.strip():
+            print(proc.stdout.strip())
+        if proc.stderr.strip():
+            print(proc.stderr.strip())
+        if proc.returncode != 0:
+            sys.exit(proc.returncode)
 
-    print(f"[Success] All {len(samples)} samples processed successfully -> {output_path}")
+    if args.eval and rows and "label" in rows[0]:
+        import evaluate
+
+        summary = evaluate.evaluate_predictions(
+            data_root=data_root,
+            split=args.split,
+            submission_path=args.output,
+            limit=args.limit,
+            sample_ids={r["id"] for r in rows} if args.ids_file else None,
+            unseen_apps=unseen_apps,
+        )
+        print("=== LOCAL EVAL SUMMARY ===")
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+
 
 if __name__ == "__main__":
     main()

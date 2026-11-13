@@ -1,101 +1,204 @@
-"""ASR Module for LifeMate — Runs vinai/PhoWhisper on CUDA GPU or CPU.
-Offline capable, reads directly from zip or disk.
-"""
+"""Offline Vietnamese ASR loader (Transformers / faster-whisper) with 16kHz resampling & dual-cache support."""
+
 from __future__ import annotations
 
-import io
+import copy
 import json
-import os
-import zipfile
-import numpy as np
-import torch
-from scipy.io import wavfile
-from transformers import pipeline
+import wave
+from pathlib import Path
+from typing import Any
 
-class LifeMateASR:
-    def __init__(self, model_name: str = "vinai/PhoWhisper-large", device: str | None = None):
-        if device is None:
-            self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+def load_asr_cache(path: Path | None) -> dict[str, str]:
+    """Load JSON `{audio_rel_path: transcript}` cache if present."""
+    if not path or not path.is_file():
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def save_asr_cache(path: Path, cache: dict[str, str]) -> None:
+    """Persist ASR cache atomically to JSON."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def lookup_cached_transcript(
+    cache: dict[str, str] | None,
+    rel_audio: str | None,
+    split_name: str,
+) -> str | None:
+    """Resolve transcript against cache checking both `<split>/<rel>` and `<rel>` keys."""
+    if not cache or not rel_audio:
+        return None
+    norm = rel_audio.replace("\\", "/").lstrip("/")
+    for key in (f"{split_name}/{norm}", norm):
+        if key in cache and cache[key]:
+            return cache[key].strip()
+    return None
+
+
+def load_audio_16k_mono(wav_path: Path):
+    """Load audio file as float32 16kHz mono NumPy array."""
+    import numpy as np
+
+    audio = None
+    sr = 16000
+    try:
+        import soundfile as sf
+
+        audio, sr = sf.read(str(wav_path), dtype="float32", always_2d=False)
+    except Exception:
+        with wave.open(str(wav_path), "rb") as wf:
+            sr = wf.getframerate()
+            n_channels = wf.getnchannels()
+            sampwidth = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+        if sampwidth == 2:
+            raw = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        elif sampwidth == 4:
+            raw = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
         else:
-            self.device = device
-            
-        print(f"[ASR] Loading {model_name} on {self.device}...")
-        torch_dtype = torch.float16 if "cuda" in self.device else torch.float32
-        self.pipe = pipeline(
-            "automatic-speech-recognition",
-            model=model_name,
-            device=self.device,
-            torch_dtype=torch_dtype
-        )
-        print(f"[ASR] Model loaded ready.")
+            raw = np.frombuffer(frames, dtype=np.uint8).astype(np.float32) / 128.0 - 1.0
+        audio = raw.reshape(-1, n_channels) if n_channels > 1 else raw
 
-    def transcribe_audio_bytes(self, raw_bytes: bytes) -> str:
-        sr, audio = wavfile.read(io.BytesIO(raw_bytes))
-        if audio.dtype == np.int16:
-            audio = audio.astype(np.float32) / 32768.0
-        elif audio.dtype != np.float32:
-            audio = audio.astype(np.float32)
-        
-        res = self.pipe({"raw": audio, "sampling_rate": sr})
-        return res.get("text", "").strip()
+    audio = np.asarray(audio, dtype=np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=-1)
 
-    def transcribe_file(self, file_path: str) -> str:
-        with open(file_path, "rb") as f:
-            return self.transcribe_audio_bytes(f.read())
+    if sr != 16000 and len(audio) > 0:
+        try:
+            from math import gcd
+            from scipy.signal import resample_poly
 
-    def batch_transcribe_from_zip(
+            g = gcd(int(sr), 16000)
+            audio = resample_poly(audio, 16000 // g, int(sr) // g).astype(np.float32)
+        except Exception:
+            target_len = int(round(len(audio) * 16000.0 / float(sr)))
+            x_old = np.linspace(0.0, 1.0, num=len(audio), endpoint=False)
+            x_new = np.linspace(0.0, 1.0, num=max(1, target_len), endpoint=False)
+            audio = np.interp(x_new, x_old, audio).astype(np.float32)
+
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 1.0:
+        audio = audio / peak
+    return audio
+
+
+class OfflineASR:
+    """Unified offline ASR wrapper supporting HuggingFace Transformers and faster-whisper."""
+
+    def __init__(
         self,
-        zip_path: str,
-        keys: list[str],
-        cache_path: str | None = None
-    ) -> dict[str, str]:
-        cache: dict[str, str] = {}
-        if cache_path and os.path.exists(cache_path):
-            try:
-                with open(cache_path, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                print(f"[ASR] Loaded existing cache: {len(cache)} entries.")
-            except Exception:
-                cache = {}
+        model_id: str = "vinai/PhoWhisper-large",
+        backend: str = "auto",
+        num_beams: int = 3,
+        local_files_only: bool = False,
+    ) -> None:
+        import torch
 
-        to_run = [k for k in keys if k not in cache]
-        print(f"[ASR] Total keys: {len(keys)}, Cached: {len(cache)}, Need run: {len(to_run)}")
+        self.model_id = model_id
+        self.num_beams = num_beams
+        self.local_files_only = local_files_only
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        if not to_run:
-            return cache
+        if backend == "auto":
+            use_fw = "faster-whisper" in model_id.lower() or model_id.lower().startswith("systran/")
+        else:
+            use_fw = backend == "faster-whisper"
 
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            for idx, key in enumerate(to_run, 1):
-                # Try path variants inside zip
-                candidates = [
-                    f"train+public_test/{key}",
-                    key,
-                    f"public_test/{key}"
-                ]
-                raw_bytes = None
-                for c in candidates:
-                    try:
-                        raw_bytes = zf.read(c)
-                        break
-                    except KeyError:
-                        continue
+        self.backend_type = "faster-whisper" if use_fw else "transformers"
 
-                if raw_bytes is None:
-                    print(f"[ASR Warning] Key not found in zip: {key}")
-                    cache[key] = ""
-                    continue
+        if use_fw:
+            from faster_whisper import WhisperModel
 
-                try:
-                    text = self.transcribe_audio_bytes(raw_bytes)
-                    cache[key] = text
-                except Exception as e:
-                    print(f"[ASR Error] Failed on {key}: {e}")
-                    cache[key] = ""
+            compute_type = "float16" if self.device == "cuda" else "int8"
+            self.fw_model = WhisperModel(
+                model_id,
+                device=self.device,
+                compute_type=compute_type,
+                local_files_only=local_files_only,
+            )
+            self.pipe = None
+        else:
+            from transformers import AutoModelForSpeechSeq2Seq, AutoProcessor, pipeline
 
-                if idx % 20 == 0 or idx == len(to_run):
-                    print(f"[ASR Progress] {idx}/{len(to_run)} done.")
-                    if cache_path:
-                        with open(cache_path, "w", encoding="utf-8") as f:
-                            json.dump(cache, f, ensure_ascii=False, indent=2)
+            dtype = torch.float16 if self.device == "cuda" else torch.float32
+            processor = AutoProcessor.from_pretrained(model_id, local_files_only=local_files_only)
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_id,
+                torch_dtype=dtype,
+                low_cpu_mem_usage=True,
+                local_files_only=local_files_only,
+            ).to(self.device)
+            model.eval()
+            self.pipe = pipeline(
+                "automatic-speech-recognition",
+                model=model,
+                tokenizer=processor.tokenizer,
+                feature_extractor=processor.feature_extractor,
+                torch_dtype=dtype,
+                device=0 if self.device == "cuda" else -1,
+            )
+            self.fw_model = None
 
-        return cache
+    def transcribe_file(self, wav_path: Path) -> str:
+        """Transcribe a single .wav file to Vietnamese text at 16kHz mono."""
+        audio = load_audio_16k_mono(wav_path)
+        if self.backend_type == "faster-whisper":
+            segments, _ = self.fw_model.transcribe(
+                audio,
+                language="vi",
+                beam_size=self.num_beams,
+                vad_filter=True,
+            )
+            return " ".join(seg.text.strip() for seg in segments).strip()
+
+        res = self.pipe(
+            {"array": audio, "sampling_rate": 16000},
+            generate_kwargs={
+                "language": "vi",
+                "task": "transcribe",
+                "num_beams": self.num_beams,
+            },
+        )
+        return (res.get("text") or "").strip()
+
+
+def hydrate_sample_transcripts(
+    sample: dict,
+    split_dir: Path,
+    split_name: str,
+    asr_engine: OfflineASR | None = None,
+    primary_cache: dict[str, str] | None = None,
+    alt_cache: dict[str, str] | None = None,
+    overwrite_existing: bool = False,
+) -> tuple[dict, str | None]:
+    """Populate missing `audio_text` on request + history user turns via cache or live ASR."""
+    out = copy.deepcopy(sample)
+
+    def resolve_text(rel_audio: str | None, existing: str | None) -> str:
+        if existing and not overwrite_existing:
+            return existing.strip()
+        cached = lookup_cached_transcript(primary_cache, rel_audio, split_name)
+        if cached is not None:
+            return cached
+        if asr_engine is not None and rel_audio:
+            wav_path = split_dir / rel_audio
+            if wav_path.is_file():
+                text = asr_engine.transcribe_file(wav_path)
+                if primary_cache is not None:
+                    norm_audio = rel_audio.replace("\\", "/").lstrip("/")
+                    key = f"{split_name}/{norm_audio}"
+                    primary_cache[key] = text
+                return text
+        return (existing or "").strip()
+
+    out["audio_text"] = resolve_text(out.get("audio"), out.get("audio_text"))
+    for turn in out.get("history") or []:
+        if turn.get("role") == "user":
+            turn["audio_text"] = resolve_text(turn.get("audio"), turn.get("audio_text"))
+
+    asr_alt = lookup_cached_transcript(alt_cache, out.get("audio"), split_name)
+    if asr_alt and asr_alt.strip().lower() == out["audio_text"].strip().lower():
+        asr_alt = None
+    return out, asr_alt
