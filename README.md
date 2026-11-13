@@ -43,7 +43,16 @@ Mở notebook [notebooks/LifeMate_Colab_Inference.ipynb](notebooks/LifeMate_Cola
 1. **Cell 1–2 (`setup-cell`, `config-cell`):** Clone/pull repo, cài thư viện, giải nén dữ liệu và chọn `MODEL_ID` (`Qwen/Qwen3-4B` hoặc `Qwen/Qwen2.5-3B-Instruct`).
 2. **Cell 3 (`asr-bench-cell`, tùy chọn):** Đo CER/WER giữa `PhoWhisper-large` và `whisper-large-v3-turbo` trên 50 file `.wav` tập `train`.
 3. **Cell 4–5 (`zeroshot-val-cell`, `train-eval-val-cell`):** Fine-tune QLoRA (`--split-mode val`) trên `1,303` mẫu, chấm điểm trên `142` mẫu Unseen-App + `100` mẫu In-Domain qua `evaluate.py` và soi lỗi với `inspect_errors.py`.
-4. **Cell 6 (`full-train-infer-cell`):** Fine-tune QLoRA (`--split-mode full`) trên toàn bộ `1,545` mẫu → infer `public_test` (`634` mẫu) → tự động backup sang Google Drive, kiểm tra `zaic_tools --validate` và tải `submission.jsonl`.
+4. **Cell 6–7 (`full-train-infer-cell`, `download-cell`):** Fine-tune QLoRA (`--split-mode full`) trên toàn bộ `1,545` mẫu → infer `public_test` (`634` mẫu) → tự động backup sang Google Drive, kiểm tra `zaic_tools --validate` và tải `submission.jsonl` (hoặc chạy Cell 7 để tải lại nếu trình duyệt chặn popup).
+
+---
+
+## Quy trình Fine-tune & Suy luận Trên Kaggle (GPU T4 x2 / P100)
+
+Mở/import notebook [notebooks/LifeMate_Kaggle_Inference.ipynb](notebooks/LifeMate_Kaggle_Inference.ipynb) trên Kaggle:
+
+1. Bật **Accelerator: GPU T4 x2** (hoặc **GPU P100**), **Internet: On**, và đính kèm dataset dữ liệu cuộc thi qua **+ Add Input**.
+2. Chạy tuần tự **Cell 1–2** (tự khóa `CUDA_VISIBLE_DEVICES=0` để tránh lỗi `DataParallel` với 4-bit `device_map="auto"`, tự tìm `/kaggle/input`), **Cell 5** (tùy chọn kiểm chứng Unseen-App CV) và **Cell 6–7** (train full `1,545` mẫu → xuất `/kaggle/working/submission.jsonl` + tạo `FileLink` tải trực tiếp).
 
 ---
 

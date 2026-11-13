@@ -223,10 +223,11 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(NoopBackend().generate(msgs), '{"tool_calls": []}')
 
     def test_notebook_valid_json(self) -> None:
-        nb_path = REPO_ROOT / "notebooks" / "LifeMate_Colab_Inference.ipynb"
-        nb = json.loads(nb_path.read_text(encoding="utf-8"))
-        self.assertEqual(nb.get("nbformat"), 4)
-        self.assertGreaterEqual(len(nb.get("cells", [])), 5)
+        for nb_name in ("LifeMate_Colab_Inference.ipynb", "LifeMate_Kaggle_Inference.ipynb"):
+            nb_path = REPO_ROOT / "notebooks" / nb_name
+            nb = json.loads(nb_path.read_text(encoding="utf-8"))
+            self.assertEqual(nb.get("nbformat"), 4)
+            self.assertGreaterEqual(len(nb.get("cells", [])), 5)
 
 
 class DatasetDependentTests(unittest.TestCase):
