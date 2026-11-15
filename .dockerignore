@@ -1,0 +1,10 @@
+.git
+rebuild-backup-*
+audit-scratch-*
+outputs
+dist
+adapter
+data
+__pycache__
+**/__pycache__
+models/**/.cache

@@ -22,3 +22,12 @@ hf_cache/
 # Submission files
 submission*.jsonl
 *.log
+
+# Rebuild checkpoints, runtime outputs and private data
+rebuild-backup-*/
+audit-scratch-*/
+outputs/
+dist/
+models/
+data/
+*.run/

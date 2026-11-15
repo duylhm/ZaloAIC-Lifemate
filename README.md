@@ -1,66 +1,70 @@
-# Zalo AI Challenge 2026 — LifeMate
+# LifeMate v2 — zero-shot baseline
 
-Pipeline **Offline Voice-to-Action Agentic** (`SLM < 5B` + `Offline Vietnamese ASR`) tuân thủ 100% thể lệ BTC:
+Pipeline hiện tại: **Gipformer 1.5 68M → Qwen3-4B → ToolEnv → JSONL**.
+Sau log Kaggle cho thấy Qwen3.5 dùng kernel PyTorch dự phòng và 10/11 mẫu đầu
+timeout, mặc định chuyển sang Qwen3-4B để đo lại. Đây là phương án thử tiếp,
+chưa có số liệu GPU chứng minh đã đạt tốc độ/điểm yêu cầu. Bản v2.1 chọn FP16
+trên GPU trước Ampere, chặn pilot khi smoke lỗi và dừng sớm TRAIN khi 3/5 mẫu
+đầu timeout. Không tăng giới hạn 30 giây để che lỗi hiệu năng.
+Bản cũ được giữ trong `rebuild-backup-20261115/`; chưa commit/push vì `.git`
+không cho ghi trong phiên làm việc. Adapter cũ và dữ liệu không bị xóa.
 
-- **Không rò rỉ `state.json`:** Agent chỉ truy xuất trạng thái thiết bị qua các lượt gọi `read` tool trên `zaic_tools.ToolEnv`.
-- **Guardrail kiểm tra trước khi gọi (`env.validate` → `env.call`):** Chặn và tự sửa tham số sai schema trước khi gọi `env.call(...)`, tránh làm bẩn `env.get_tool_calls()`, đồng thời trả `schema_validation_error` lại cho model tự sửa ở lượt kế tiếp.
-- **Tổng quát hóa sang Unseen Apps:** Nén chữ ký tool có kiểu dữ liệu (`format_compact_tool`), phân rã chuỗi hành động theo Causal DAG, tăng cường **App-Dropout**, xáo trộn thứ tự tool và tính **Prompt Loss Masking** chỉ trên các lượt trả lời của assistant.
+## Chạy trên Kaggle
 
----
+1. Giải nén `LifeMate_v2_Kit.zip`. Import `LifeMate_v2_Kaggle.ipynb`.
+2. Upload **LifeMate_v2_Source.zip bản mới** thành private dataset, gắn dataset đó
+   và dataset BTC qua Add Input. Dataset source cũ không dùng với notebook v2.
+3. Bật GPU và Internet. Chạy 8 cell code theo bảng dưới; chỉ 5 cell đầu tự chạy
+   công việc. Để SOURCE/DATA_ROOT trống nếu chỉ có một bộ source/data; hoặc điền
+   path file ZIP hay thư mục đã giải nén. Không sửa cell setup.
 
-## Cấu trúc Thư mục
+| Cell | Công việc | Output cần xem |
+|---|---|---|
+| 1 config | Chọn source/data/model, mặc định Qwen3 + Gipformer | Biến cấu hình |
+| 2 setup | Nhận ZIP hoặc thư mục, cài thư viện | `Setup complete` |
+| 3 preflight | Kiểm tra GPU, đủ audio, pin revision, tạo split | Tên GPU, SHA, số mẫu mỗi tập |
+| 4 smoke | 5 mẫu pilot chạy audio → JSONL | Thời gian, timeout, trace |
+| 5 pilot | Cùng mẫu: gold vs ASR | score, state_match, tool_f1, chênh lệch |
+| 6 confirm | Bật RUN_CONFIRM sau khi xem pilot | Kết quả tập độc lập |
+| 7 public | Bật RUN_PUBLIC khi đã chốt | `submission.jsonl` |
+| 8 export | Bật EXPORT_OFFLINE để tải weights cho Docker | Thư mục deploy |
 
-- `src/prompt_builder.py` — Chuẩn hóa `time_anchors`, giữ đầy đủ `history` (`calls` + `results`), hỗ trợ `asr_alt` và nén schema theo `installed_apps` + `sys.ask_missing_info`.
-- `src/trajectory.py` — Gom `tool_calls` thành các bước nhân quả (`group_trajectory_into_steps`), App-Dropout, nhiễu âm vị tiếng Việt an toàn, chuyển ChatML và masking loss (`labels = -100`) trên prompt/tool results.
-- `src/guardrails.py` — Lọc `<think>` / markdown fence, tách JSON, ép kiểu số nguyên tiếng Việt (`1.200.000` → `1200000`), chuẩn hóa `date` / `date-time` / `time` và bỏ tham số mặc định thừa.
-- `src/agent.py` — Vòng lặp ReAct `LifeMateAgent` + backend `HFTransformersBackend` (4-bit NF4, LoRA, hỗ trợ Qwen3 `enable_thinking=False`), `OpenAICompatibleBackend`, `HeuristicBackend`, `NoopBackend`.
-- `src/asr.py` — `OfflineASR` (`vinai/PhoWhisper-large` / `faster-whisper`) hỗ trợ resample 16kHz mono, nhận dạng cả lượt chính và lịch sử `_u*.wav`, kết hợp dual-cache.
-- `src/data_utils.py` — Tự động dò thư mục dữ liệu trên máy local Windows / Google Colab và tiện ích đọc/ghi JSONL.
-- `scripts/prepare_splits.py` — Tạo bộ kiểm thử nội bộ tại `splits/`: `val_unseen.json` (`142` mẫu thuộc 4 app ẩn: `bike_rental`, `exchange_rate`, `medication`, `package_tracking`), `val_indomain.json` (`100` mẫu phân tầng) và `val_all.json`.
-- `scripts/benchmark_asr.py` — Benchmark CER/WER ASR tiếng Việt trên audio tập `train` và tái tạo cache `public_test` trên Colab T4.
-- `scripts/inspect_errors.py` — Phân tích các ca lỗi theo từng nhóm bằng `evaluate.py`.
-- `train_sft.py` — Huấn luyện QLoRA multi-turn SFT (`--split-mode val` và `--split-mode full`).
-- `run_inference.py` — Suy luận ReAct có checkpoint/resume, tự chạy `zaic_tools --validate` và tùy chọn `--eval`.
-- `docker/Dockerfile` & `docker/run.sh` — Đóng gói Docker chạy offline hoàn toàn (`HF_HUB_OFFLINE=1`, `--no-cache`) cho `private_test`.
+Kết quả: `/kaggle/working/lifemate-v2-results/`. Lưu cả thư mục Output sau phiên.
+Nếu bị ngắt, chạy lại cell đó. Phiên Kaggle mới: gắn output cũ, điền RESUME_FROM,
+giữ nguyên source/cấu hình/model revision. Nếu thư viện hoặc cấu hình thay đổi,
+runner từ chối trộn kết quả; đổi RUN_NAME để bắt đầu phép thử mới.
 
----
+Trước khi chạy tiếp, xem `*.summary.json` và `*.traces.jsonl`. Nếu nhiều timeout
+hoặc context overflow, xử lý tốc độ/context trước. Nếu thử Qwen3-4B làm đối chứng,
+đổi MODEL_ID, để MODEL_REVISION trống, đổi RUN_NAME rồi chạy lại từ cell 3.
 
-## Quy trình Kiểm thử Tại Local (Windows PowerShell / CPU)
-
-```powershell
-python -m unittest tests/test_pipeline.py -v
-python scripts/prepare_splits.py
-python run_inference.py --split train --ids-file splits/val_all.json --backend noop --force --output outputs/val_noop.jsonl --eval
-python run_inference.py --split train --ids-file splits/val_all.json --backend heuristic --force --output outputs/val_heuristic.jsonl --eval
-```
-
----
-
-## Quy trình Fine-tune & Suy luận Trên Google Colab (GPU T4)
-
-Mở notebook [notebooks/LifeMate_Colab_Inference.ipynb](notebooks/LifeMate_Colab_Inference.ipynb) trên Google Colab (chọn Runtime **T4 GPU**), mount Google Drive chứa `train+public_test.zip` và chạy tuần tự các cell:
-
-1. **Cell 1–2 (`setup-cell`, `config-cell`):** Clone/pull repo, cài thư viện, giải nén dữ liệu và chọn `MODEL_ID` (`Qwen/Qwen3-4B` hoặc `Qwen/Qwen2.5-3B-Instruct`).
-2. **Cell 3 (`asr-bench-cell`, tùy chọn):** Đo CER/WER giữa `PhoWhisper-large` và `whisper-large-v3-turbo` trên 50 file `.wav` tập `train`.
-3. **Cell 4–5 (`zeroshot-val-cell`, `train-eval-val-cell`):** Fine-tune QLoRA (`--split-mode val`) trên `1,303` mẫu, chấm điểm trên `142` mẫu Unseen-App + `100` mẫu In-Domain qua `evaluate.py` và soi lỗi với `inspect_errors.py`.
-4. **Cell 6–7 (`full-train-infer-cell`, `download-cell`):** Fine-tune QLoRA (`--split-mode full`) trên toàn bộ `1,545` mẫu → infer `public_test` (`634` mẫu) → tự động backup sang Google Drive, kiểm tra `zaic_tools --validate` và tải `submission.jsonl` (hoặc chạy Cell 7 để tải lại nếu trình duyệt chặn popup).
-
----
-
-## Quy trình Fine-tune & Suy luận Trên Kaggle (GPU T4 x2 / P100)
-
-Mở/import notebook [notebooks/LifeMate_Kaggle_Inference.ipynb](notebooks/LifeMate_Kaggle_Inference.ipynb) trên Kaggle:
-
-1. Bật **Accelerator: GPU T4 x2** (hoặc **GPU P100**), **Internet: On**, và đính kèm dataset dữ liệu cuộc thi qua **+ Add Input**.
-2. Chạy tuần tự **Cell 1–2** (tự khóa `CUDA_VISIBLE_DEVICES=0` để tránh lỗi `DataParallel` với 4-bit `device_map="auto"`, tự tìm `/kaggle/input`), **Cell 5** (tùy chọn kiểm chứng Unseen-App CV) và **Cell 6–7** (train full `1,545` mẫu → xuất `/kaggle/working/submission.jsonl` + tạo `FileLink` tải trực tiếp).
-
----
-
-## Build & Chạy Docker Offline (`private_test`)
-
-Copy weights LoRA đã train vào thư mục `adapter/`, sau đó build và chạy container ở chế độ không mạng (`--network none`):
+## Lệnh chính
 
 ```bash
-docker build -f docker/Dockerfile -t lifemate-agent .
-docker run --rm --gpus all --network none -v /path/to/private_test:/data -v /path/to/out:/output lifemate-agent /data /output/submission.jsonl private_test
+python scripts/prepare_splits.py --root /data --output outputs/splits
+python run_inference.py --root /data --split train --ids outputs/splits/pilot.json --asr gold --output outputs/pilot_gold.jsonl --evaluate
+python run_inference.py --root /data --split train --ids outputs/splits/pilot.json --asr gipformer --output outputs/pilot_asr.jsonl --evaluate
+python scripts/compare.py outputs/pilot_gold.jsonl outputs/pilot_asr.jsonl
+python run_inference.py --root /data --split public_test --asr gipformer --output outputs/submission.jsonl
+python evaluate.py --root /data --split public_test --prediction outputs/submission.jsonl
 ```
+
+Để tái lập, truyền `--revision` và `--asr-revision` theo file pins của notebook.
+Inference chỉ nhập ToolEnv của đúng split. Label chỉ được đọc trong evaluator,
+split và oracle test. Không đọc trực tiếp state.json từ code Agent.
+
+## Kiểm tra và giới hạn
+
+```bash
+python -m unittest discover -s tests -v
+python scripts/verify_train_replay.py --root /data --output outputs/oracle-check.json
+```
+
+Oracle cấp sẵn gold calls để kiểm tra Agent/runtime; **không phải điểm model**.
+Xem [docs/VALIDATION.md](docs/VALIDATION.md) cho kết quả local thực tế và phần
+chưa chạy. GPU inference, so sánh ASR và Docker offline chưa được xác nhận trên
+máy này. Chưa có submission mới hay cải thiện leaderboard được đo.
+
+QLoRA vẫn đóng theo kế hoạch đã duyệt: chỉ mở khi có lỗi Agent cụ thể và đủ
+ngân sách xác nhận. Không k-fold, ensemble hoặc model soup ở baseline này.
+Xem [kế hoạch thử nghiệm](docs/EXPERIMENT_PLAN.md) và [Docker](docker/README.md).
